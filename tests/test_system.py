@@ -26,6 +26,12 @@ def login(c,name):
 
 PAYLOAD=dict(title='Projector is broken',description='The projector does not start during the morning lecture.',category='Classroom',location='Block A',severity='High')
 
+def test_production_requires_database(monkeypatch):
+    monkeypatch.setenv('APP_ENV','production')
+    monkeypatch.delenv('DATABASE_URL',raising=False)
+    with pytest.raises(RuntimeError,match='DATABASE_URL'):
+        create_app()
+
 def test_auth_csrf_and_no_self_promotion(app):
     c=app.test_client()
     assert c.get('/api/complaints').status_code==401

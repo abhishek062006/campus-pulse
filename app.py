@@ -62,6 +62,8 @@ def create_app(test_config=None):
     if url.startswith('postgres://'): url = url.replace('postgres://', 'postgresql+psycopg://', 1)
     elif url.startswith('postgresql://'): url = url.replace('postgresql://', 'postgresql+psycopg://', 1)
     production = os.getenv('APP_ENV') == 'production'
+    if production and not os.getenv('DATABASE_URL'):
+        raise RuntimeError('DATABASE_URL must point to persistent PostgreSQL in production')
     secret = os.getenv('SECRET_KEY')
     if production and not secret: raise RuntimeError('SECRET_KEY must be set in production')
     app.config.update(SECRET_KEY=secret or secrets.token_hex(32), SQLALCHEMY_DATABASE_URI=url,
