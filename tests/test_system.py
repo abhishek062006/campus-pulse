@@ -19,12 +19,14 @@ def app():
     with a.app_context(): db.drop_all()
 
 def login(c,name):
+    portal='registrar' if name in ['s','s2'] else 'checker'
+    c.environ_base['HTTP_X_PORTAL']=portal
     token=c.get('/api/session').json['csrf']
-    r=c.post('/api/login',json={'email':name+'@college.test','password':'long-test-password'},headers={'X-CSRF-Token':token})
+    r=c.post(f'/api/auth/{portal}/login',json={'email':name+'@college.test','password':'long-test-password'},headers={'X-CSRF-Token':token})
     assert r.status_code==200
-    return {'X-CSRF-Token':r.json['csrf']}
+    return {'X-CSRF-Token':r.json['csrf'],'X-Portal':portal}
 
-PAYLOAD=dict(title='Projector is broken',description='The projector does not start during the morning lecture.',category='Classroom',location='Block A',severity='High')
+PAYLOAD=dict(title='Projector is broken',description='The projector does not start during the morning lecture.',category='Classroom',location='Block A',severity='High',reported_impact='Students cannot see lecture slides.',reported_reason='Teaching is interrupted during lectures.',reported_cause='A loose cable is suspected, not confirmed.')
 
 def test_production_requires_database(monkeypatch):
     monkeypatch.setenv('APP_ENV','production')
@@ -34,6 +36,7 @@ def test_production_requires_database(monkeypatch):
 
 def test_auth_csrf_and_no_self_promotion(app):
     c=app.test_client()
+    c.environ_base['HTTP_X_PORTAL']='registrar'
     assert c.get('/api/complaints').status_code==401
     assert c.post('/api/register',json={}).status_code==403
     token=c.get('/api/session').json['csrf']
@@ -50,15 +53,21 @@ def test_full_lifecycle_permissions_assignment_and_sla(app):
     it=app.test_client(); ih=login(it,'it'); assert it.patch(f'/api/complaints/{cid}',json={'message':'hello'},headers=ih).status_code==404
     off=app.test_client(); fh=login(off,'off')
     assert off.patch(f'/api/complaints/{cid}',json={'message':'Reassign requested','department':'IT Services'},headers=fh).status_code==403
-    r=off.patch(f'/api/complaints/{cid}',json={'message':'Technician scheduled','status':'In Progress'},headers=fh); assert r.status_code==200
+    r=off.patch(f'/api/complaints/{cid}',json={'message':'Complaint checked for referral','status':'Reviewed'},headers=fh); assert r.status_code==200
     admin=app.test_client(); ah=login(admin,'admin')
     assert admin.patch(f'/api/complaints/{cid}',json={'message':'IT team to inspect cable','department':'IT Services'},headers=ah).status_code==200
     assert off.get('/api/complaints').json['complaints']==[]
-    r=it.patch(f'/api/complaints/{cid}',json={'status':'Resolved','message':'Cable replaced and tested'},headers=ih)
-    assert r.status_code==200 and r.json['complaint']['resolved_at']
-    assert len(s.get('/api/complaints').json['complaints'][0]['events'])==4
-    assert it.patch(f'/api/complaints/{cid}',json={'status':'Submitted','message':'reopen test'},headers=ih).status_code==400
-    a=admin.get('/api/analytics');assert a.status_code==200 and a.json['summary']['resolved']==1
+    assert it.patch(f'/api/complaints/{cid}',json={'status':'Resolved','message':'Cable replaced and tested'},headers=ih).status_code==400
+    r=it.patch(f'/api/complaints/{cid}/brief',json={'checker_cause':'Not established; inspect the display cable.','checker_effect':'Lecture visibility and delivery are affected.','checker_reason':'Restore access to teaching materials promptly.'},headers=ih)
+    assert r.status_code==200 and r.json['complaint']['resolved_at'] is None
+    assert r.json['complaint']['brief']['reviewed_by']=='it'
+    assert r.json['complaint']['brief']['cause_verified'] is False
+    r=it.patch(f'/api/complaints/{cid}',json={'status':'Forwarded','message':'Conveyed the target time and impact to IT staff.'},headers=ih)
+    assert r.status_code==200 and r.json['complaint']['status']=='Forwarded'
+    tracked=s.get('/api/complaints').json['complaints'][0]
+    assert len(tracked['events'])==5 and tracked['brief']['reported_impact']==PAYLOAD['reported_impact']
+    assert tracked['brief']['target_hours']==24 and not tracked['brief']['physical_resolution_confirmed']
+    a=admin.get('/api/analytics');assert a.status_code==200 and a.json['summary']['resolved']==0
     with app.app_context(): assert db.session.get(Complaint,cid).initial_department=='Facilities'
 
 def test_demo_isolation_and_model_fallback(app):
@@ -66,7 +75,7 @@ def test_demo_isolation_and_model_fallback(app):
         from seed import seed_demo
         seed_demo()
     c=app.test_client(); h=login(c,'s'); c.post('/api/complaints',json=PAYLOAD,headers=h)
-    d=app.test_client();token=d.get('/api/session').json['csrf'];r=d.post('/api/demo',json={'role':'admin'},headers={'X-CSRF-Token':token});dh={'X-CSRF-Token':r.json['csrf']}
+    d=app.test_client();d.environ_base['HTTP_X_PORTAL']='checker';token=d.get('/api/session').json['csrf'];r=d.post('/api/auth/checker/demo',json={'role':'admin'},headers={'X-CSRF-Token':token});dh={'X-CSRF-Token':r.json['csrf']}
     rows=d.get('/api/complaints').json['complaints'];assert len(rows)==96 and all(c['is_demo'] for c in rows)
     assert d.get('/api/analytics').status_code==200
     assert d.get('/api/model').json['eligible_real_rows']==0
@@ -98,3 +107,32 @@ def test_role_management_and_security_headers(app):
     me=next(u for u in users if u['role']=='admin');assert c.patch('/api/users/'+str(me['id']),headers=h,json={'role':'student'}).status_code==400
     r=c.get('/');assert r.status_code==200 and "frame-ancestors 'none'" in r.headers['Content-Security-Policy']
     c.post('/api/logout',headers=h,json={});assert c.get('/api/users').status_code==401
+
+def test_separate_portal_logins_and_independent_sessions(app):
+    c=app.test_client();student_headers=login(c,'s')
+    assert c.post('/api/auth/registrar/login',headers=student_headers,json={'email':'off@college.test','password':'long-test-password'}).status_code==403
+    assert c.post('/api/auth/registrar/demo',headers=student_headers,json={'role':'admin'}).status_code==403
+    staff_headers=login(c,'off')
+    assert c.get('/api/session',headers={'X-Portal':'registrar'}).json['user']['email']=='s@college.test'
+    assert c.get('/api/session',headers={'X-Portal':'checker'}).json['user']['email']=='off@college.test'
+    assert c.post('/api/auth/checker/login',headers=staff_headers,json={'email':'s@college.test','password':'long-test-password'}).status_code==403
+    assert c.post('/api/register',headers=staff_headers,json={}).status_code==403
+    assert c.post('/api/auth/registrar/login',headers=staff_headers,json={}).status_code==400
+    c.post('/api/logout',headers=staff_headers,json={})
+    assert c.get('/api/session',headers={'X-Portal':'checker'}).json['user'] is None
+    assert c.get('/api/session',headers={'X-Portal':'registrar'}).json['user']['role']=='student'
+    assert c.post('/api/complaints',headers=student_headers,json=PAYLOAD).status_code==201
+    for path in ['/','/register-complaint','/complaint-checker']:
+        assert c.get(path).status_code==200
+
+def test_brief_access_controls_and_required_effects(app):
+    s=app.test_client();sh=login(s,'s')
+    bad=dict(PAYLOAD);bad.pop('reported_impact')
+    assert s.post('/api/complaints',headers=sh,json=bad).status_code==400
+    c=s.post('/api/complaints',headers=sh,json=PAYLOAD).json['complaint']
+    assert c['brief']['assessment_source'].startswith('Category guidance')
+    assert 'inspection' in c['brief']['possible_cause']
+    body=dict(checker_cause='Not established; inspection needed.',checker_reason='Teaching is interrupted.',checker_effect='Students cannot view learning materials.')
+    assert s.patch(f'/api/complaints/{c["id"]}/brief',headers=sh,json=body).status_code==403
+    other=app.test_client();oh=login(other,'it')
+    assert other.patch(f'/api/complaints/{c["id"]}/brief',headers=oh,json=body).status_code==404

@@ -56,6 +56,18 @@ class ModelVersion(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=now)
     report = db.Column(db.JSON, nullable=False)
 
+class ComplaintBrief(db.Model):
+    """Additive table: preserves existing complaints without changing their schema."""
+    complaint_id = db.Column(db.Integer, db.ForeignKey('complaint.id'), primary_key=True)
+    reported_impact = db.Column(db.Text, nullable=False, default='')
+    reported_cause = db.Column(db.Text, nullable=False, default='')
+    reported_reason = db.Column(db.Text, nullable=False, default='')
+    checker_cause = db.Column(db.Text)
+    checker_effect = db.Column(db.Text)
+    checker_reason = db.Column(db.Text)
+    reviewed_by = db.Column(db.String(100))
+    reviewed_at = db.Column(db.DateTime)
+
 def create_app(test_config=None):
     app = Flask(__name__, static_folder='static')
     url = os.getenv('DATABASE_URL', 'sqlite:///campus.db')
@@ -76,7 +88,18 @@ def create_app(test_config=None):
     limiter = Limiter(get_remote_address, app=app, default_limits=['300 per minute'], storage_uri='memory://')
     app.extensions['campus_limiter'] = limiter
 
-    def current(): return db.session.get(User, session.get('uid')) if session.get('uid') else None
+    def portal(): return request.headers.get('X-Portal', '')
+    def current():
+        uid=session.get('uid_'+portal()) if portal() in ['registrar','checker'] else None
+        u=db.session.get(User,uid) if uid else None
+        if u and ((portal()=='registrar' and u.role=='student') or (portal()=='checker' and u.role in ['officer','admin'])): return u
+        return None
+    def sign_in(u):
+        # Independent identities and CSRF tokens let both portals stay signed in.
+        session['uid_'+portal()]=u.id
+        session['csrf_'+portal()]=secrets.token_hex(32)
+        session.permanent=True
+        return jsonify(user=user_json(u),csrf=session['csrf_'+portal()])
     def auth(*roles):
         def decorate(fn):
             @wraps(fn)
@@ -93,18 +116,21 @@ def create_app(test_config=None):
         return u.role == 'admin' or (u.role == 'officer' and c.department == u.department) or (u.role == 'student' and c.user_id == u.id)
     def user_json(u): return dict(id=u.id, name=u.name, email=u.email, role=u.role, department=u.department, is_demo=u.is_demo)
     def serialize(c):
+        from triage import build_brief
         hours = ((c.resolved_at or now()) - c.submitted_at).total_seconds()/3600
         return dict(id=c.id, title=c.title, description=c.description, category=c.category, department=c.department,
             location=c.location, severity=c.severity, status=c.status, submitted_at=iso(c.submitted_at),
             resolved_at=iso(c.resolved_at), sla_hours=c.sla_hours, due_at=iso(c.submitted_at+timedelta(hours=c.sla_hours)),
             elapsed_hours=round(hours,1), overdue=hours>c.sla_hours, is_demo=c.is_demo,
+            brief=build_brief(c,db.session.get(ComplaintBrief,c.id)),
             events=[dict(actor=e.actor,message=e.message,created_at=iso(e.created_at)) for e in c.events])
 
     @app.before_request
     def csrf():
         if request.path.startswith('/api/') and request.method in ['POST','PATCH','PUT','DELETE']:
+            if portal() not in ['registrar','checker']: return jsonify(error='Choose the complaint registration or checker portal.'),400
             token = request.headers.get('X-CSRF-Token', '')
-            if not token or not secrets.compare_digest(token, session.get('csrf','')):
+            if not token or not secrets.compare_digest(token, session.get('csrf_'+portal(),'')):
                 return jsonify(error='Session expired. Refresh the page and retry.'), 403
 
     @app.after_request
@@ -125,6 +151,8 @@ def create_app(test_config=None):
     def bad(e): return jsonify(error='Invalid request.'), 400
 
     @app.get('/')
+    @app.get('/register-complaint')
+    @app.get('/complaint-checker')
     def index(): return send_from_directory(app.static_folder, 'index.html')
     @app.get('/health')
     def health():
@@ -132,43 +160,51 @@ def create_app(test_config=None):
         return jsonify(status='ok')
     @app.get('/api/session')
     def get_session():
-        if 'csrf' not in session: session['csrf']=secrets.token_hex(32)
+        if portal() not in ['registrar','checker']: return jsonify(error='Choose a portal.'),400
+        key='csrf_'+portal()
+        if key not in session: session[key]=secrets.token_hex(32)
         u=current()
-        return jsonify(user=user_json(u) if u else None, csrf=session['csrf'], categories=list(CATEGORIES), departments=DEPARTMENTS, sla=SLA)
+        return jsonify(user=user_json(u) if u else None, csrf=session[key], categories=list(CATEGORIES), departments=DEPARTMENTS, sla=SLA)
 
     @app.post('/api/register')
     @limiter.limit('5 per hour')
     def register():
+        if portal()!='registrar': return jsonify(error='Student accounts are created in the complaint registration portal. Checker access is assigned by an administrator.'),403
         d=request.get_json() or {}; name=str(d.get('name','')).strip(); email=str(d.get('email','')).strip().lower(); password=str(d.get('password',''))
         if not 2<=len(name)<=100 or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email) or len(email)>254 or not 12<=len(password)<=128:
             return jsonify(error='Enter a name, valid email, and a password of 12–128 characters.'),400
         if db.session.scalar(select(User).where(User.email==email)): return jsonify(error='Unable to register this email. Try signing in.'),400
         u=User(name=name,email=email,password=generate_password_hash(password),role='student')
-        db.session.add(u); db.session.commit(); session.clear(); session.update(uid=u.id,csrf=secrets.token_hex(32)); session.permanent=True
-        return jsonify(user=user_json(u),csrf=session['csrf']),201
+        db.session.add(u); db.session.commit()
+        response=sign_in(u); response.status_code=201; return response
 
-    @app.post('/api/login')
+    @app.post('/api/auth/<login_portal>/login')
     @limiter.limit('10 per minute')
-    def login():
+    def login(login_portal):
+        if login_portal!=portal(): return jsonify(error='Login portal does not match.'),400
         d=request.get_json() or {}; email=str(d.get('email','')).strip().lower(); password=str(d.get('password',''))[:129]
         u=db.session.scalar(select(User).where(User.email==email))
         hashed=u.password if u else app.config['DUMMY_HASH']
         if not check_password_hash(hashed,password) or not u: return jsonify(error='Email or password is incorrect.'),401
-        session.clear(); session.update(uid=u.id,csrf=secrets.token_hex(32)); session.permanent=True
-        return jsonify(user=user_json(u),csrf=session['csrf'])
+        if (portal()=='registrar' and u.role!='student') or (portal()=='checker' and u.role not in ['officer','admin']):
+            return jsonify(error='This account belongs to the other portal. Use a student account for registration or a staff account for the checker.'),403
+        return sign_in(u)
 
-    @app.post('/api/demo')
+    @app.post('/api/auth/<login_portal>/demo')
     @limiter.limit('20 per minute')
-    def demo():
+    def demo(login_portal):
+        if login_portal!=portal(): return jsonify(error='Login portal does not match.'),400
         role=(request.get_json() or {}).get('role')
         if role not in ['student','officer','admin']: return jsonify(error='Invalid role.'),400
+        if (portal()=='registrar' and role!='student') or (portal()=='checker' and role=='student'): return jsonify(error='Choose a demo account for this portal.'),403
         u=db.session.scalar(select(User).where(User.email==f'{role}@demo.campus',User.is_demo.is_(True)))
         if not u: return jsonify(error='Demo is disabled.'),404
-        session.clear(); session.update(uid=u.id,csrf=secrets.token_hex(32)); session.permanent=True
-        return jsonify(user=user_json(u),csrf=session['csrf'])
+        return sign_in(u)
 
     @app.post('/api/logout')
-    def logout(): session.clear(); return jsonify(ok=True)
+    def logout():
+        session.pop('uid_'+portal(),None); session.pop('csrf_'+portal(),None)
+        return jsonify(ok=True)
 
     @app.get('/api/complaints')
     @auth()
@@ -187,8 +223,13 @@ def create_app(test_config=None):
         if not 5<=len(values['title'])<=160 or not 15<=len(values['description'])<=5000 or not 2<=len(values['location'])<=120 or values['category'] not in CATEGORIES or values['severity'] not in SLA:
             return jsonify(error='Check all fields: title 5–160, description 15–5000, location 2–120 characters.'),400
         dep=CATEGORIES[values['category']]
+        impact=str(d.get('reported_impact','')).strip(); reason=str(d.get('reported_reason','')).strip(); cause=str(d.get('reported_cause','')).strip()
+        if not 5<=len(impact)<=2000 or not 5<=len(reason)<=2000 or len(cause)>2000:
+            return jsonify(error='Explain who or what is affected and why attention is needed (5–2000 characters each). Cause is optional, up to 2000 characters.'),400
         c=Complaint(**values,user_id=u.id,department=dep,initial_department=dep,sla_hours=SLA[values['severity']],is_demo=u.is_demo)
-        db.session.add(c); db.session.flush(); db.session.add(Event(complaint_id=c.id,actor=u.name,message=f'Complaint submitted and assigned to {dep}.'))
+        db.session.add(c); db.session.flush()
+        db.session.add(ComplaintBrief(complaint_id=c.id,reported_impact=impact,reported_cause=cause,reported_reason=reason))
+        db.session.add(Event(complaint_id=c.id,actor=u.name,message=f'Complaint conveyed to {dep} for checking. No repair or resolution is confirmed.'))
         db.session.commit(); return jsonify(complaint=serialize(c)),201
 
     @app.patch('/api/complaints/<int:cid>')
@@ -197,15 +238,30 @@ def create_app(test_config=None):
         c=db.session.get(Complaint,cid); u=current()
         if not c or not visible(c,u): return jsonify(error='Complaint not found.'),404
         d=request.get_json() or {}; message=str(d.get('message','')).strip(); status=d.get('status',c.status); dep=d.get('department',c.department)
-        if not 5<=len(message)<=2000 or status not in ['Submitted','In Progress','Resolved'] or dep not in DEPARTMENTS:
+        if not 5<=len(message)<=2000 or status not in ['Submitted','Reviewed','Forwarded'] or dep not in DEPARTMENTS:
             return jsonify(error='Select a valid status and add an update of 5–2000 characters.'),400
         if dep!=c.department and u.role!='admin': return jsonify(error='Only administrators can reassign departments.'),403
-        if c.status=='Resolved' and status!='Resolved': return jsonify(error='Resolved complaints are closed. Submit a new complaint for recurring issues.'),400
+        if c.resolved_at: return jsonify(error='This is a historical resolution record. New complaints can only be reviewed or forwarded here.'),400
         if c.department!=dep: message=f'Reassigned from {c.department} to {dep}. '+message
         c.department=dep
-        if status=='Resolved' and c.status!='Resolved': c.resolved_at=now()
         c.status=status; db.session.add(Event(complaint_id=c.id,actor=u.name,message=f'{status}: {message}')); db.session.commit()
         return jsonify(complaint=serialize(c))
+
+    @app.patch('/api/complaints/<int:cid>/brief')
+    @auth('officer','admin')
+    def review_brief(cid):
+        c=db.session.get(Complaint,cid); u=current()
+        if not c or not visible(c,u): return jsonify(error='Complaint not found.'),404
+        d=request.get_json() or {}
+        values={k:str(d.get(k,'')).strip() for k in ['checker_cause','checker_effect','checker_reason']}
+        if any(not 5<=len(v)<=2000 for v in values.values()): return jsonify(error='Provide cause assessment, effects and reason for attention (5–2000 characters each). Use “Not established” when evidence is missing.'),400
+        b=db.session.get(ComplaintBrief,cid)
+        if not b: b=ComplaintBrief(complaint_id=cid); db.session.add(b)
+        for k,v in values.items(): setattr(b,k,v)
+        b.reviewed_by=u.name; b.reviewed_at=now()
+        if not c.resolved_at: c.status='Reviewed'
+        db.session.add(Event(complaint_id=cid,actor=u.name,message='Checker assessment recorded. Cause remains an assessment; no repair or physical resolution is confirmed.'))
+        db.session.commit(); return jsonify(complaint=serialize(c))
 
     @app.get('/api/analytics')
     @auth('admin')
