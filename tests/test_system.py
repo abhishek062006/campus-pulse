@@ -136,3 +136,30 @@ def test_brief_access_controls_and_required_effects(app):
     assert s.patch(f'/api/complaints/{c["id"]}/brief',headers=sh,json=body).status_code==403
     other=app.test_client();oh=login(other,'it')
     assert other.patch(f'/api/complaints/{c["id"]}/brief',headers=oh,json=body).status_code==404
+
+def test_staff_signup_login_and_administrator_approval(app):
+    staff=app.test_client();staff.environ_base['HTTP_X_PORTAL']='checker'
+    token=staff.get('/api/session').json['csrf']
+    body=dict(name='New Staff Member',email='staff@college.test',password='strong-staff-password',department='Facilities',role='admin',is_demo=True)
+    r=staff.post('/api/auth/checker/register',json=body,headers={'X-CSRF-Token':token})
+    assert r.status_code==201 and r.json['user']['role']=='pending_staff'
+    assert not r.json['user']['is_demo'] and r.json['user']['approval_status']=='pending'
+    h={'X-CSRF-Token':r.json['csrf']}
+    assert staff.get('/api/session').json['user']['name']=='New Staff Member'
+    for path in ['complaints','analytics','users','model']:
+        assert staff.get('/api/'+path).status_code==403
+    assert staff.post('/api/predict',json=PAYLOAD,headers=h).status_code==403
+    assert staff.patch('/api/users/'+str(r.json['user']['id']),json={'role':'admin'},headers=h).status_code==403
+    staff.post('/api/logout',headers=h,json={})
+    token=staff.get('/api/session').json['csrf']
+    r=staff.post('/api/auth/checker/login',json={'email':body['email'],'password':body['password']},headers={'X-CSRF-Token':token})
+    assert r.status_code==200 and r.json['user']['role']=='pending_staff'
+    admin=app.test_client();ah=login(admin,'admin')
+    pending=next(u for u in admin.get('/api/users').json['users'] if u['email']==body['email'])
+    assert pending['department']=='Facilities'
+    r=admin.patch('/api/users/'+str(pending['id']),json={'role':'officer','department':'Facilities'},headers=ah)
+    assert r.status_code==200 and r.json['user']['approval_status']=='active'
+    assert staff.get('/api/session').json['user']['role']=='officer'
+    assert staff.get('/api/complaints').status_code==200
+    student=app.test_client();sh=login(student,'s')
+    assert student.post('/api/auth/checker/register',json=body,headers=sh).status_code==403

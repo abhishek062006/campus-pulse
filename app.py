@@ -92,7 +92,7 @@ def create_app(test_config=None):
     def current():
         uid=session.get('uid_'+portal()) if portal() in ['registrar','checker'] else None
         u=db.session.get(User,uid) if uid else None
-        if u and ((portal()=='registrar' and u.role=='student') or (portal()=='checker' and u.role in ['officer','admin'])): return u
+        if u and ((portal()=='registrar' and u.role=='student') or (portal()=='checker' and u.role in ['officer','admin','pending_staff'])): return u
         return None
     def sign_in(u):
         # Independent identities and CSRF tokens let both portals stay signed in.
@@ -106,6 +106,7 @@ def create_app(test_config=None):
             def wrapped(*args, **kwargs):
                 u = current()
                 if not u: return jsonify(error='Please sign in.'), 401
+                if u.role=='pending_staff': return jsonify(error='Your staff account is awaiting administrator approval.'),403
                 if roles and u.role not in roles: return jsonify(error='You do not have permission.'), 403
                 return fn(*args, **kwargs)
             return wrapped
@@ -114,7 +115,7 @@ def create_app(test_config=None):
         # Demo accounts operate only on sample records. Real students never expose complaints to demo staff.
         if u.is_demo != c.is_demo: return False
         return u.role == 'admin' or (u.role == 'officer' and c.department == u.department) or (u.role == 'student' and c.user_id == u.id)
-    def user_json(u): return dict(id=u.id, name=u.name, email=u.email, role=u.role, department=u.department, is_demo=u.is_demo)
+    def user_json(u): return dict(id=u.id, name=u.name, email=u.email, role=u.role, department=u.department, is_demo=u.is_demo, approval_status='pending' if u.role=='pending_staff' else 'active')
     def serialize(c):
         from triage import build_brief
         hours = ((c.resolved_at or now()) - c.submitted_at).total_seconds()/3600
@@ -178,6 +179,21 @@ def create_app(test_config=None):
         db.session.add(u); db.session.commit()
         response=sign_in(u); response.status_code=201; return response
 
+    @app.post('/api/auth/checker/register')
+    @limiter.limit('5 per hour')
+    def register_staff():
+        if portal()!='checker': return jsonify(error='Use the staff checker portal to create a staff account.'),403
+        d=request.get_json() or {}
+        name=str(d.get('name','')).strip(); email=str(d.get('email','')).strip().lower()
+        password=str(d.get('password','')); department=d.get('department')
+        if not 2<=len(name)<=100 or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email) or len(email)>254 or not 12<=len(password)<=128 or department not in DEPARTMENTS:
+            return jsonify(error='Enter a name, valid staff email, department, and a password of 12–128 characters.'),400
+        if db.session.scalar(select(User).where(User.email==email)): return jsonify(error='Unable to register this email. Try signing in.'),400
+        # Never grant staff privileges based only on public sign-up or a claimed role.
+        u=User(name=name,email=email,password=generate_password_hash(password),role='pending_staff',department=department,is_demo=False)
+        db.session.add(u); db.session.commit()
+        response=sign_in(u); response.status_code=201; return response
+
     @app.post('/api/auth/<login_portal>/login')
     @limiter.limit('10 per minute')
     def login(login_portal):
@@ -186,7 +202,7 @@ def create_app(test_config=None):
         u=db.session.scalar(select(User).where(User.email==email))
         hashed=u.password if u else app.config['DUMMY_HASH']
         if not check_password_hash(hashed,password) or not u: return jsonify(error='Email or password is incorrect.'),401
-        if (portal()=='registrar' and u.role!='student') or (portal()=='checker' and u.role not in ['officer','admin']):
+        if (portal()=='registrar' and u.role!='student') or (portal()=='checker' and u.role not in ['officer','admin','pending_staff']):
             return jsonify(error='This account belongs to the other portal. Use a student account for registration or a staff account for the checker.'),403
         return sign_in(u)
 
@@ -315,8 +331,8 @@ def create_app(test_config=None):
         if not u or u.is_demo!=me.is_demo: return jsonify(error='User not found.'),404
         if me.is_demo: return jsonify(error='Demo staff permissions are fixed.'),403
         if u.id==me.id: return jsonify(error='You cannot change your own role.'),400
-        if role not in ['student','officer','admin'] or (role=='officer' and dep not in DEPARTMENTS): return jsonify(error='Choose a valid role and department.'),400
-        u.role=role; u.department=dep if role=='officer' else None; db.session.commit(); return jsonify(user=user_json(u))
+        if role not in ['student','officer','admin','pending_staff'] or (role in ['officer','pending_staff'] and dep not in DEPARTMENTS): return jsonify(error='Choose a valid role and department.'),400
+        u.role=role; u.department=dep if role in ['officer','pending_staff'] else None; db.session.commit(); return jsonify(user=user_json(u))
 
     with app.app_context():
         db.create_all(); app.config['DUMMY_HASH']=generate_password_hash(secrets.token_hex(20))
