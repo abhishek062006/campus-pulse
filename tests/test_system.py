@@ -56,7 +56,8 @@ def test_full_lifecycle_permissions_assignment_and_sla(app):
     r=off.patch(f'/api/complaints/{cid}',json={'message':'Complaint checked for referral','status':'Reviewed'},headers=fh); assert r.status_code==200
     admin=app.test_client(); ah=login(admin,'admin')
     assert admin.patch(f'/api/complaints/{cid}',json={'message':'IT team to inspect cable','department':'IT Services'},headers=ah).status_code==200
-    assert off.get('/api/complaints').json['complaints']==[]
+    visible_after_reassignment=off.get('/api/complaints').json['complaints']
+    assert len(visible_after_reassignment)==1 and not visible_after_reassignment[0]['can_review']
     assert it.patch(f'/api/complaints/{cid}',json={'status':'Resolved','message':'Cable replaced and tested'},headers=ih).status_code==400
     r=it.patch(f'/api/complaints/{cid}/brief',json={'checker_cause':'Not established; inspect the display cable.','checker_effect':'Lecture visibility and delivery are affected.','checker_reason':'Restore access to teaching materials promptly.'},headers=ih)
     assert r.status_code==200 and r.json['complaint']['resolved_at'] is None
@@ -156,6 +157,7 @@ def test_staff_signup_login_and_administrator_approval(app):
     assert r.status_code==200 and r.json['user']['role']=='pending_staff'
     admin=app.test_client();ah=login(admin,'admin')
     pending=next(u for u in admin.get('/api/users').json['users'] if u['email']==body['email'])
+    assert pending['id'] in [u['id'] for u in admin.get('/api/staff-requests').json['requests']]
     assert pending['department']=='Facilities'
     r=admin.patch('/api/users/'+str(pending['id']),json={'role':'officer','department':'Facilities'},headers=ah)
     assert r.status_code==200 and r.json['user']['approval_status']=='active'
@@ -163,3 +165,46 @@ def test_staff_signup_login_and_administrator_approval(app):
     assert staff.get('/api/complaints').status_code==200
     student=app.test_client();sh=login(student,'s')
     assert student.post('/api/auth/checker/register',json=body,headers=sh).status_code==403
+
+def test_every_approved_staff_and_admin_sees_student_complaint(app):
+    student=app.test_client();sh=login(student,'s')
+    cid=student.post('/api/complaints',headers=sh,json=PAYLOAD).json['complaint']['id']
+    for name in ['off','it','admin']:
+        c=app.test_client();h=login(c,name)
+        row=next(r for r in c.get('/api/complaints').json['complaints'] if r['id']==cid)
+        assert row['can_review']==(name in ['off','admin'])
+        if name!='admin': assert c.get('/api/staff-requests').status_code==403
+    other=app.test_client();login(other,'s2');assert other.get('/api/complaints').json['complaints']==[]
+
+def test_exact_sample_cleanup_preserves_user_submissions(app):
+    from seed import seed_demo
+    from maintenance import remove_assistant_samples,VERIFICATION
+    from app import ComplaintBrief
+    with app.app_context():
+        seed_demo()
+        demo_student=db.session.query(User).filter_by(email='student@demo.campus').one()
+        real_student=db.session.query(User).filter_by(email='s@college.test').one()
+        for cid,(title,description) in VERIFICATION.items():
+            db.session.add(Complaint(id=cid,user_id=demo_student.id,title=title,description=description,category='Classroom',department='Facilities',initial_department='Facilities',location='Demo verification room',severity='High',sla_hours=24,is_demo=True))
+        db.session.flush();db.session.add(ComplaintBrief(complaint_id=98,reported_impact='Test fixture'))
+        for cid,uid,demo in [(99,demo_student.id,True),(100,real_student.id,False)]:
+            db.session.add(Complaint(id=cid,user_id=uid,title='Actual student submitted concern',description='A genuine user report that must be preserved.',category='Classroom',department='Facilities',initial_department='Facilities',location='Block A',severity='High',sla_hours=24,is_demo=demo))
+        db.session.commit()
+        report=remove_assistant_samples();assert report['removed_count']==98
+        assert [c.id for c in db.session.query(Complaint).order_by(Complaint.id)]==[99,100]
+        assert db.session.get(ComplaintBrief,98) is None
+        assert remove_assistant_samples()==report
+
+def test_live_mode_disables_demo_and_explicit_admin_login(app):
+    from seed import seed_demo
+    with app.app_context(): seed_demo()
+    demo=app.test_client();demo.environ_base['HTTP_X_PORTAL']='checker'
+    token=demo.get('/api/session').json['csrf'];r=demo.post('/api/auth/checker/demo',headers={'X-CSRF-Token':token},json={'role':'admin'})
+    assert r.status_code==200
+    app.config['DEMO_ENABLED']=False
+    assert demo.get('/api/session').json['user'] is None
+    assert demo.get('/api/users').status_code==401
+    token=demo.get('/api/session').json['csrf']
+    assert demo.post('/api/auth/checker/demo',headers={'X-CSRF-Token':token},json={'role':'admin'}).status_code==404
+    assert demo.post('/api/auth/checker/login',headers={'X-CSRF-Token':token},json={'email':'off@college.test','password':'long-test-password','login_as':'administrator'}).status_code==403
+    assert demo.post('/api/auth/checker/login',headers={'X-CSRF-Token':token},json={'email':'admin@college.test','password':'long-test-password','login_as':'administrator'}).status_code==200

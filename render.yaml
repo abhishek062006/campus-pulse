@@ -10,6 +10,12 @@ services:
     envVars:
       - key: APP_ENV
         value: production
+      - key: SEED_DEMO
+        value: "false"
+      - key: ENABLE_DEMO
+        value: "false"
+      - key: CLEANUP_ASSISTANT_SAMPLES
+        value: "true"
       - key: SECRET_KEY
         generateValue: true
       - key: ADMIN_EMAIL

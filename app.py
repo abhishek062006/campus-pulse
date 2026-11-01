@@ -68,6 +68,11 @@ class ComplaintBrief(db.Model):
     reviewed_by = db.Column(db.String(100))
     reviewed_at = db.Column(db.DateTime)
 
+class MaintenanceRun(db.Model):
+    key = db.Column(db.String(100), primary_key=True)
+    completed_at = db.Column(db.DateTime, nullable=False, default=now)
+    report = db.Column(db.JSON, nullable=False)
+
 def create_app(test_config=None):
     app = Flask(__name__, static_folder='static')
     url = os.getenv('DATABASE_URL', 'sqlite:///campus.db')
@@ -79,6 +84,7 @@ def create_app(test_config=None):
     secret = os.getenv('SECRET_KEY')
     if production and not secret: raise RuntimeError('SECRET_KEY must be set in production')
     app.config.update(SECRET_KEY=secret or secrets.token_hex(32), SQLALCHEMY_DATABASE_URI=url,
+        DEMO_ENABLED=os.getenv('ENABLE_DEMO','false' if production else 'true').lower()=='true',
         SQLALCHEMY_TRACK_MODIFICATIONS=False, MAX_CONTENT_LENGTH=64*1024,
         SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=production,
         PERMANENT_SESSION_LIFETIME=timedelta(hours=8))
@@ -92,6 +98,7 @@ def create_app(test_config=None):
     def current():
         uid=session.get('uid_'+portal()) if portal() in ['registrar','checker'] else None
         u=db.session.get(User,uid) if uid else None
+        if u and u.is_demo and not app.config['DEMO_ENABLED']: return None
         if u and ((portal()=='registrar' and u.role=='student') or (portal()=='checker' and u.role in ['officer','admin','pending_staff'])): return u
         return None
     def sign_in(u):
@@ -123,6 +130,7 @@ def create_app(test_config=None):
             location=c.location, severity=c.severity, status=c.status, submitted_at=iso(c.submitted_at),
             resolved_at=iso(c.resolved_at), sla_hours=c.sla_hours, due_at=iso(c.submitted_at+timedelta(hours=c.sla_hours)),
             elapsed_hours=round(hours,1), overdue=hours>c.sla_hours, is_demo=c.is_demo,
+            can_review=bool(current() and current().role in ['officer','admin'] and visible(c,current())),
             brief=build_brief(c,db.session.get(ComplaintBrief,c.id)),
             events=[dict(actor=e.actor,message=e.message,created_at=iso(e.created_at)) for e in c.events])
 
@@ -165,7 +173,7 @@ def create_app(test_config=None):
         key='csrf_'+portal()
         if key not in session: session[key]=secrets.token_hex(32)
         u=current()
-        return jsonify(user=user_json(u) if u else None, csrf=session[key], categories=list(CATEGORIES), departments=DEPARTMENTS, sla=SLA)
+        return jsonify(user=user_json(u) if u else None, csrf=session[key], categories=list(CATEGORIES), departments=DEPARTMENTS, sla=SLA,demo_enabled=app.config['DEMO_ENABLED'])
 
     @app.post('/api/register')
     @limiter.limit('5 per hour')
@@ -202,6 +210,9 @@ def create_app(test_config=None):
         u=db.session.scalar(select(User).where(User.email==email))
         hashed=u.password if u else app.config['DUMMY_HASH']
         if not check_password_hash(hashed,password) or not u: return jsonify(error='Email or password is incorrect.'),401
+        if u.is_demo and not app.config['DEMO_ENABLED']: return jsonify(error='Demo accounts are disabled. Sign in with your registered campus account.'),403
+        if d.get('login_as')=='administrator' and u.role!='admin': return jsonify(error='This is not an administrator account. Use Staff sign in for staff accounts.'),403
+        if d.get('login_as')=='staff' and u.role=='admin': return jsonify(error='Use Administrator sign in for this administrator account.'),403
         if (portal()=='registrar' and u.role!='student') or (portal()=='checker' and u.role not in ['officer','admin','pending_staff']):
             return jsonify(error='This account belongs to the other portal. Use a student account for registration or a staff account for the checker.'),403
         return sign_in(u)
@@ -209,6 +220,7 @@ def create_app(test_config=None):
     @app.post('/api/auth/<login_portal>/demo')
     @limiter.limit('20 per minute')
     def demo(login_portal):
+        if not app.config['DEMO_ENABLED']: return jsonify(error='Demo access is disabled. Use your own student or staff account.'),404
         if login_portal!=portal(): return jsonify(error='Login portal does not match.'),400
         role=(request.get_json() or {}).get('role')
         if role not in ['student','officer','admin']: return jsonify(error='Invalid role.'),400
@@ -227,7 +239,7 @@ def create_app(test_config=None):
     def complaints():
         u=current(); q=select(Complaint).where(Complaint.is_demo==u.is_demo)
         if u.role=='student': q=q.where(Complaint.user_id==u.id)
-        if u.role=='officer': q=q.where(Complaint.department==u.department)
+        # Approved staff can read all campus complaints; writes remain department-scoped.
         return jsonify(complaints=[serialize(c) for c in db.session.scalars(q.order_by(Complaint.submitted_at.desc()))])
 
     @app.post('/api/complaints')
@@ -324,6 +336,21 @@ def create_app(test_config=None):
     def users():
         return jsonify(users=[user_json(u) for u in db.session.scalars(select(User).where(User.is_demo==current().is_demo).order_by(User.name))])
 
+    @app.get('/api/staff-requests')
+    @auth('admin')
+    def staff_requests():
+        u=current()
+        requests=list(db.session.scalars(select(User).where(User.is_demo==u.is_demo,User.role=='pending_staff').order_by(User.id.desc())))
+        return jsonify(requests=[user_json(person) for person in requests],count=len(requests),administrator_email=u.email,is_demo=u.is_demo)
+
+    @app.get('/api/maintenance/sample-cleanup')
+    @auth('admin')
+    def cleanup_status():
+        if current().is_demo: return jsonify(error='Real administrator access is required.'),403
+        from maintenance import KEY
+        run=db.session.get(MaintenanceRun,KEY)
+        return jsonify(completed=bool(run),report=run.report if run else None)
+
     @app.patch('/api/users/<int:uid>')
     @auth('admin')
     def set_role(uid):
@@ -341,7 +368,12 @@ def create_app(test_config=None):
 
 def initialize():
     from seed import seed_demo
-    if os.getenv('SEED_DEMO','true').lower()=='true': seed_demo()
+    if os.getenv('CLEANUP_ASSISTANT_SAMPLES','true' if os.getenv('APP_ENV')=='production' else 'false').lower()=='true':
+        from maintenance import remove_assistant_samples
+        report=remove_assistant_samples()
+        import logging
+        logging.getLogger('gunicorn.error').info('Assistant sample cleanup: %s records removed; exact sample fingerprints only.',report['removed_count'])
+    if os.getenv('SEED_DEMO','false').lower()=='true': seed_demo()
     email=os.getenv('ADMIN_EMAIL'); password=os.getenv('ADMIN_PASSWORD')
     if email and password:
         if len(password)<12: raise RuntimeError('ADMIN_PASSWORD must have at least 12 characters')

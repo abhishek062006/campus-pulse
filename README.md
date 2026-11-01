@@ -4,6 +4,14 @@ A full-stack college complaint conveyance system with two separate login portals
 
 The platform conveys, assesses and forwards complaints. It does not perform repairs or allow new complaints to be marked physically resolved.
 
+## Real-account production workspace
+
+The live application disables demo sign-in and seeded complaints. The checker login page has separate **Staff sign in** and **Administrator sign in** tabs. Use the real administrator account (`admin@campuspulse.local`, with the private password in Render) to review real staff requests; former demo administrators cannot read or approve those requests. Staff approvals uses a dedicated pending-request endpoint, identifies the signed-in administrator, and refreshes idle approval/overview pages every 30 seconds.
+
+Student submissions are visible to their submitting student, **all approved staff**, and the real administrator. Staff outside the assigned department have read-only access. Only the assigned department or an administrator can record assessments and forwarding updates. Pending staff have no complaint access.
+
+At the user's request, a one-time production maintenance task removes only the assistant's exact seeded complaint fingerprints (original records 1–96 with the seed event marker) and exact verification records 97–98. It preserves all other student submissions, including any other demo-user submissions. It removes related brief/timeline rows, records its result in `maintenance_run`, and will not repeat. `SEED_DEMO=false` prevents reseeding; `ENABLE_DEMO=false` disables former demo sessions and credentials. This cleanup never deletes complaints merely because they have a demo flag. The administrator can inspect its report at `/api/maintenance/sample-cleanup` through an authenticated administrator request.
+
 ## Run locally
 
 Use Python 3.12. Create a virtual environment, install `requirements.txt`, then run `flask --app wsgi run`. Open http://127.0.0.1:5000. Run `pytest -q` for integration and ML tests.
