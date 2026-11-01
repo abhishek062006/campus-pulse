@@ -208,3 +208,59 @@ def test_live_mode_disables_demo_and_explicit_admin_login(app):
     assert demo.post('/api/auth/checker/demo',headers={'X-CSRF-Token':token},json={'role':'admin'}).status_code==404
     assert demo.post('/api/auth/checker/login',headers={'X-CSRF-Token':token},json={'email':'off@college.test','password':'long-test-password','login_as':'administrator'}).status_code==403
     assert demo.post('/api/auth/checker/login',headers={'X-CSRF-Token':token},json={'email':'admin@college.test','password':'long-test-password','login_as':'administrator'}).status_code==200
+
+def test_delayed_and_solved_replies_visible_to_student_and_admin(app):
+    student=app.test_client();sh=login(student,'s')
+    cid=student.post('/api/complaints',headers=sh,json=PAYLOAD).json['complaint']['id']
+    staff=app.test_client();fh=login(staff,'off')
+    expected=(now()+timedelta(days=2)).isoformat()+'Z'
+    delay=dict(status='Delayed',message='We are waiting for a replacement projector cable.',delay_reason='The required replacement cable is not available in stock.',expected_resolution_at=expected)
+    r=staff.patch(f'/api/complaints/{cid}',headers=fh,json=delay)
+    assert r.status_code==200 and r.json['complaint']['status']=='Delayed'
+    assert r.json['complaint']['resolved_at'] is None
+    tracked=student.get('/api/complaints').json['complaints'][0]
+    assert tracked['replies'][0]['delay_reason']==delay['delay_reason']
+    assert tracked['replies'][0]['expected_resolution_at']==expected
+    assert tracked['replies'][0]['actor']=='off'
+    original_due=tracked['due_at']
+    revised=dict(delay,expected_resolution_at=(now()+timedelta(days=3)).isoformat()+'Z',message='Supplier confirmed a revised delivery date.')
+    assert staff.patch(f'/api/complaints/{cid}',headers=fh,json=revised).status_code==200
+    assert student.get('/api/complaints').json['complaints'][0]['due_at']==original_due
+    # Assessment edits must not erase a delayed status.
+    brief=dict(checker_cause='Cable connection requires inspection.',checker_effect='Teaching slides are not visible.',checker_reason='Lecture delivery is interrupted.')
+    assert staff.patch(f'/api/complaints/{cid}/brief',headers=fh,json=brief).json['complaint']['status']=='Delayed'
+    r=staff.patch(f'/api/complaints/{cid}',headers=fh,json={'status':'Solved','message':'Replacement cable installed and projector tested successfully.'})
+    assert r.status_code==200 and r.json['complaint']['resolved_at']
+    tracked=student.get('/api/complaints').json['complaints'][0]
+    assert tracked['status']=='Solved' and len(tracked['replies'])==3
+    assert tracked['replies'][0]['expected_resolution_at']==expected
+    assert tracked['replies'][-1]['status']=='Solved' and tracked['replies'][-1]['delay_reason'] is None
+    assert 'Resolution reported by staff' in tracked['events'][-1]['message']
+    assert staff.patch(f'/api/complaints/{cid}',headers=fh,json=delay).status_code==400
+    admin=app.test_client();login(admin,'admin')
+    assert admin.get('/api/complaints').json['complaints'][0]['replies']==tracked['replies']
+    summary=admin.get('/api/analytics').json['summary'];assert summary['resolved']==1 and summary['open']==0 and summary['overdue']==0
+    other=app.test_client();login(other,'s2');assert other.get('/api/complaints').json['complaints']==[]
+    with app.app_context():
+        f=ml.features(db.session.get(Complaint,cid))
+        assert 'delay_reason' not in f and 'expected_resolution_at' not in f
+
+def test_delay_requires_reason_and_future_timezone_aware_eta(app):
+    from app import StaffReply,Event
+    student=app.test_client();sh=login(student,'s')
+    cid=student.post('/api/complaints',headers=sh,json=PAYLOAD).json['complaint']['id']
+    staff=app.test_client();fh=login(staff,'off')
+    good=dict(status='Delayed',message='Awaiting replacement equipment.',delay_reason='The supplier has not delivered replacement equipment.',expected_resolution_at=(now()+timedelta(days=1)).isoformat()+'Z')
+    for change in [{'delay_reason':''},{'expected_resolution_at':''},{'expected_resolution_at':'not-a-date'},{'expected_resolution_at':(now()+timedelta(days=1)).isoformat()},{'expected_resolution_at':(now()-timedelta(days=1)).isoformat()+'Z'}]:
+        assert staff.patch(f'/api/complaints/{cid}',headers=fh,json=dict(good,**change)).status_code==400
+    assert student.patch(f'/api/complaints/{cid}',headers=sh,json=good).status_code==403
+    other=app.test_client();oh=login(other,'it')
+    assert other.patch(f'/api/complaints/{cid}',headers=oh,json=good).status_code==404
+    with app.app_context():
+        assert db.session.get(Complaint,cid).status=='Submitted'
+        assert db.session.query(StaffReply).count()==0 and db.session.query(Event).count()==1
+    # A timezone offset is normalized to UTC before storing.
+    future=(now()+timedelta(days=2)).replace(microsecond=0)
+    offset_time=(future+timedelta(hours=5,minutes=30)).isoformat()+'+05:30'
+    r=staff.patch(f'/api/complaints/{cid}',headers=fh,json=dict(good,expected_resolution_at=offset_time))
+    assert r.json['complaint']['replies'][0]['expected_resolution_at']==future.isoformat()+'Z'

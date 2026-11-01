@@ -43,6 +43,7 @@ class Complaint(db.Model):
     sla_hours = db.Column(db.Integer, nullable=False)
     is_demo = db.Column(db.Boolean, nullable=False, default=False)
     events = db.relationship('Event', backref='complaint', cascade='all, delete-orphan', order_by='Event.created_at')
+    replies = db.relationship('StaffReply', backref='complaint', cascade='all, delete-orphan', order_by='StaffReply.id')
 
 class Event(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -55,6 +56,17 @@ class ModelVersion(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     created_at = db.Column(db.DateTime, nullable=False, default=now)
     report = db.Column(db.JSON, nullable=False)
+
+class StaffReply(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    complaint_id = db.Column(db.Integer, db.ForeignKey('complaint.id'), nullable=False)
+    actor = db.Column(db.String(100), nullable=False)
+    department = db.Column(db.String(80), nullable=False)
+    status = db.Column(db.String(20), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    delay_reason = db.Column(db.Text)
+    expected_resolution_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, nullable=False, default=now)
 
 class ComplaintBrief(db.Model):
     """Additive table: preserves existing complaints without changing their schema."""
@@ -131,6 +143,7 @@ def create_app(test_config=None):
             resolved_at=iso(c.resolved_at), sla_hours=c.sla_hours, due_at=iso(c.submitted_at+timedelta(hours=c.sla_hours)),
             elapsed_hours=round(hours,1), overdue=hours>c.sla_hours, is_demo=c.is_demo,
             can_review=bool(current() and current().role in ['officer','admin'] and visible(c,current())),
+            replies=[dict(id=r.id,actor=r.actor,department=r.department,status=r.status,message=r.message,delay_reason=r.delay_reason,expected_resolution_at=iso(r.expected_resolution_at),created_at=iso(r.created_at)) for r in c.replies],
             brief=build_brief(c,db.session.get(ComplaintBrief,c.id)),
             events=[dict(actor=e.actor,message=e.message,created_at=iso(e.created_at)) for e in c.events])
 
@@ -266,13 +279,31 @@ def create_app(test_config=None):
         c=db.session.get(Complaint,cid); u=current()
         if not c or not visible(c,u): return jsonify(error='Complaint not found.'),404
         d=request.get_json() or {}; message=str(d.get('message','')).strip(); status=d.get('status',c.status); dep=d.get('department',c.department)
-        if not 5<=len(message)<=2000 or status not in ['Submitted','Reviewed','Forwarded'] or dep not in DEPARTMENTS:
+        if not 5<=len(message)<=2000 or status not in ['Submitted','Reviewed','Forwarded','Delayed','Solved'] or dep not in DEPARTMENTS:
             return jsonify(error='Select a valid status and add an update of 5–2000 characters.'),400
         if dep!=c.department and u.role!='admin': return jsonify(error='Only administrators can reassign departments.'),403
-        if c.resolved_at: return jsonify(error='This is a historical resolution record. New complaints can only be reviewed or forwarded here.'),400
+        if c.resolved_at: return jsonify(error='This complaint already has a recorded resolution and is closed.'),400
+        delay_reason=None; expected=None
+        if status=='Delayed':
+            delay_reason=str(d.get('delay_reason','')).strip()
+            if not 5<=len(delay_reason)<=2000: return jsonify(error='Explain why the complaint is delayed (5–2000 characters).'),400
+            try:
+                raw=str(d.get('expected_resolution_at',''))
+                if len(raw)>64: raise ValueError()
+                parsed=datetime.fromisoformat(raw.replace('Z','+00:00'))
+                if parsed.tzinfo is None: raise ValueError()
+                expected=parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            except (ValueError,OverflowError): return jsonify(error='Enter a valid expected resolution date and time, including timezone.'),400
+            if expected<=now(): return jsonify(error='Expected resolution must be a future date and time.'),400
         if c.department!=dep: message=f'Reassigned from {c.department} to {dep}. '+message
         c.department=dep
-        c.status=status; db.session.add(Event(complaint_id=c.id,actor=u.name,message=f'{status}: {message}')); db.session.commit()
+        c.status=status
+        if status=='Solved': c.resolved_at=now()
+        db.session.add(StaffReply(complaint_id=c.id,actor=u.name,department=dep,status=status,message=message,delay_reason=delay_reason,expected_resolution_at=expected))
+        event_message=f'{status}: {message}'
+        if status=='Delayed': event_message+=f' Reason for delay: {delay_reason}. Expected resolution: {iso(expected)} (staff estimate).'
+        if status=='Solved': event_message+=' Resolution reported by staff.'
+        db.session.add(Event(complaint_id=c.id,actor=u.name,message=event_message)); db.session.commit()
         return jsonify(complaint=serialize(c))
 
     @app.patch('/api/complaints/<int:cid>/brief')
@@ -287,7 +318,7 @@ def create_app(test_config=None):
         if not b: b=ComplaintBrief(complaint_id=cid); db.session.add(b)
         for k,v in values.items(): setattr(b,k,v)
         b.reviewed_by=u.name; b.reviewed_at=now()
-        if not c.resolved_at: c.status='Reviewed'
+        if not c.resolved_at and c.status in ['Submitted','In Progress']: c.status='Reviewed'
         db.session.add(Event(complaint_id=cid,actor=u.name,message='Checker assessment recorded. Cause remains an assessment; no repair or physical resolution is confirmed.'))
         db.session.commit(); return jsonify(complaint=serialize(c))
 
@@ -297,8 +328,8 @@ def create_app(test_config=None):
         u=current(); rows=list(db.session.scalars(select(Complaint).where(Complaint.is_demo==u.is_demo)))
         def stats(items):
             closed=[c for c in items if c.resolved_at]; delayed=[c for c in closed if (c.resolved_at-c.submitted_at).total_seconds()>c.sla_hours*3600]
-            return dict(total=len(items),open=sum(c.status!='Resolved' for c in items),resolved=len(closed),delayed=len(delayed),
-                overdue=sum(c.status!='Resolved' and now()>c.submitted_at+timedelta(hours=c.sla_hours) for c in items),
+            return dict(total=len(items),open=sum(c.resolved_at is None for c in items),resolved=len(closed),delayed=len(delayed),
+                overdue=sum(c.resolved_at is None and now()>c.submitted_at+timedelta(hours=c.sla_hours) for c in items),
                 mean_hours=round(sum((c.resolved_at-c.submitted_at).total_seconds()/3600 for c in closed)/len(closed),1) if closed else None,
                 delay_rate=round(len(delayed)/len(closed)*100,1) if closed else None)
         trends=[]
